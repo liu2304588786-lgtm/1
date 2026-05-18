@@ -1,0 +1,14 @@
+node_modules/
+.next/
+dist/
+artifacts/
+cache/
+coverage/
+deployments/
+.env
+.env.local
+frontend/.env.local
+backend/.env
+contracts/.env
+npm-debug.log*
+

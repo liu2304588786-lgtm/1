@@ -1,0 +1,17 @@
+{
+  "name": "altfun-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node src/index.js"
+  },
+  "dependencies": {
+    "@bouncetech/contracts": "^1.5.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "ethers": "^6.15.0",
+    "express": "^5.1.0",
+    "ws": "^8.18.3"
+  }
+}
