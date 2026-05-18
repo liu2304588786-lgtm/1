@@ -1,0 +1,361 @@
+核心目的为仿造一个alt.fun 一摸一样功能机制的网站产品
+
+总架构
+┌─────────────────────────────────────────┐
+│           前端 (React/Next.js)           │
+│  发币页 / 交易页 / 行情页 / 毕业页        │
+└────────────────┬────────────────────────┘
+                 │
+┌────────────────▼────────────────────────┐
+│           后端 API (Node.js)             │
+│  价格聚合 / 事件监听 / 毕业触发检测       │
+└──────┬──────────────┬───────────────────┘
+       │              │
+┌──────▼──────┐ ┌─────▼──────────────────┐
+│BounceTech   │ │  你的链上合约           │
+│Indexing API │ │  (HyperEVM Solidity)    │
+│(免费公开)   │ │  BondingCurve + AMM     │
+└─────────────┘ └────────────────────────┘
+
+模块一：Solidity 合约层
+合约1：BondingCurve.sol（核心）
+// 你给合约开发的需求描述：
+
+// 状态变量
+address public ltToken;          // BounceTech LT 合约地址
+uint256 public virtualReserveX;  // 虚拟代币储备（含25%虚拟部分）
+uint256 public virtualReserveY;  // 虚拟LT储备
+uint256 public realReserveX;     // 真实代币储备（75%）
+uint256 public realReserveY;     // 真实LT储备
+uint256 public constant S = 1_000_000_000e18; // 总供应10亿
+uint256 public constant V = 3000e6;  // 种子市值$3000(USDC 6位小数)
+uint256 public constant GRAD_USD_THRESHOLD = 9000e6; // 毕业USD阈值$9000
+
+// 核心函数
+function buy(uint256 usdcIn, uint256 minTokenOut) external;
+// 流程：USDC→铸造LT→加入y储备→按xy=k计算→转出代币
+
+function sell(uint256 tokenIn, uint256 minUsdcOut) external;
+// 流程：代币→加入x储备→按xy=k计算→取出LT→赎回LT→USDC给用户
+
+function checkGraduation() public view returns (bool);
+// 检查两个毕业条件
+
+function graduate() external;
+// 任何人都可调用，迁移流动性到AMM
+
+合约2：AltCoinFactory.sol
+// 工厂合约，一键发币
+
+function launch(
+    string memory name,
+    string memory symbol,
+    address ltToken,      // 选哪个BounceTech LT
+    string memory imageUri,
+    string memory description
+) external returns (address bondingCurve, address token);
+
+// CREATE2部署，地址末尾固定后缀（防伪）
+
+合约3：LPLocker.sol
+// 毕业时LP永久锁定
+// 无withdraw函数
+// 只能接收LP token，不能转出
+1. Virtuals Protocol 开源代码（bonding curve实现）
+   https://github.com/Virtual-Protocol/protocol-contracts
+
+2. BounceTech 合约ABI
+   https://github.com/bounce-tech/bounce-npm
+
+3. alt.fun 机制
+
+模块二：后端服务
+backend/
+├── src/
+│   ├── services/
+│   │   ├── bouncetech.js    # 对接BounceTech API
+│   │   ├── onchain.js       # 读链上数据
+│   │   ├── graduation.js    # 毕业监控
+│   │   └── price.js         # 价格聚合
+│   ├── routes/
+│   │   ├── tokens.js        # 代币列表/详情
+│   │   ├── trades.js        # 交易记录
+│   │   └── market.js        # 行情数据
+│   └── index.js
+
+bouncetech.js — 对接官方API
+const BASE = "https://indexing.bounce.tech";
+
+// 获取所有LT列表（可选哪些标的）
+export async function getLeveragedTokens() {
+  const res = await fetch(`${BASE}/leveraged-tokens`);
+  const { data } = await res.json();
+  return data; // 包含地址、杠杆倍数、标的资产、当前汇率
+}
+
+// 获取某个LT的当前价格（exchangeRate）
+export async function getLTPrice(ltAddress) {
+  const res = await fetch(`${BASE}/leveraged-tokens`);
+  const { data } = await res.json();
+  const lt = data.find(t => 
+    t.address.toLowerCase() === ltAddress.toLowerCase()
+  );
+  // exchangeRate 是 1e18 为基准的定点数
+  return BigInt(lt.exchangeRate);
+}
+
+// 获取协议总体数据
+export async function getProtocolStats() {
+  const res = await fetch(`${BASE}/protocol-metrics`);
+  return (await res.json()).data;
+}
+onchain.js — 读链上合约
+import { ethers } from "ethers";
+import { BONDING_CURVE_ABI } from "./abis.js";
+
+const provider = new ethers.JsonRpcProvider(
+  "https://rpc.hyperliquid.xyz/evm"
+);
+
+// 读取某个代币的bonding curve状态
+export async function getCurveState(curveAddress) {
+  const curve = new ethers.Contract(
+    curveAddress, BONDING_CURVE_ABI, provider
+  );
+
+  const [rx, ry, vx, vy, ltAddress] = await Promise.all([
+    curve.realReserveX(),
+    curve.realReserveY(),
+    curve.virtualReserveX(),
+    curve.virtualReserveY(),
+    curve.ltToken(),
+  ]);
+
+  return { rx, ry, vx, vy, ltAddress };
+}
+
+// 计算当前代币价格（纯JS，不上链）
+export function calcTokenPrice(vy, vx, ltPrice) {
+  // p_token = (y * p_LT) / x
+  // 注意单位换算：LT是1e18，USDC是1e6，代币是1e18
+  return (vy * ltPrice) / vx;
+}
+
+// 预测买入价格（报价）
+export function quoteBuy(usdcIn, vx, vy, ltPrice) {
+  // 先算能买到多少LT
+  const ltIn = (usdcIn * BigInt(1e18)) / ltPrice;
+  // xy=k，新的x
+  const k = vx * vy;
+  const newVy = vy + ltIn;
+  const newVx = k / newVy;
+  const tokenOut = vx - newVx;
+  return tokenOut;
+}
+
+graduation.js — 毕业监控（Keeper Bot）
+import { ethers } from "ethers";
+
+// 每30秒检查所有存活曲线是否达到毕业条件
+export async function startGraduationKeeper(curveAddresses) {
+  const wallet = new ethers.Wallet(process.env.KEEPER_PRIVATE_KEY, provider);
+  
+  setInterval(async () => {
+    for (const addr of curveAddresses) {
+      try {
+        const curve = new ethers.Contract(addr, BONDING_CURVE_ABI, wallet);
+        const shouldGraduate = await curve.checkGraduation();
+        
+        if (shouldGraduate) {
+          console.log(`毕业触发: ${addr}`);
+          const tx = await curve.graduate({ gasLimit: 500000 });
+          await tx.wait();
+          console.log(`毕业完成: ${tx.hash}`);
+          // 从监控列表移除
+          curveAddresses.delete(addr);
+        }
+      } catch (e) {
+        console.error(`检查失败 ${addr}:`, e.message);
+      }
+    }
+  }, 30_000);
+}
+
+price.js — 价格聚合与推送（WebSocket）
+import { WebSocketServer } from "ws";
+
+// 维护所有代币的实时价格
+const priceCache = new Map();
+
+// 每5秒刷新LT价格，推送给前端
+export function startPriceFeed(wss, activeCurves) {
+  setInterval(async () => {
+    const ltPrices = await getLTPrice(); // 批量拉取
+    
+    for (const [curveAddr, curveData] of activeCurves) {
+      const ltPrice = ltPrices.get(curveData.ltAddress);
+      const tokenPrice = calcTokenPrice(
+        curveData.vy, curveData.vx, ltPrice
+      );
+      
+      priceCache.set(curveAddr, tokenPrice);
+      
+      // 广播给所有订阅该代币的前端客户端
+      wss.clients.forEach(client => {
+        if (client.subscriptions?.has(curveAddr)) {
+          client.send(JSON.stringify({
+            type: "price",
+            token: curveAddr,
+            price: tokenPrice.toString(),
+            timestamp: Date.now()
+          }));
+        }
+      });
+    }
+  }, 5000);
+}
+
+模块三：前端
+frontend/
+├── app/
+│   ├── page.tsx           # 首页（代币列表）
+│   ├── launch/page.tsx    # 发币页
+│   ├── token/[addr]/
+│   │   └── page.tsx       # 代币交易页
+│   └── graduated/page.tsx # 已毕业代币
+├── components/
+│   ├── BondingCurveChart.tsx  # 价格曲线图
+│   ├── TradePanel.tsx         # 买卖面板
+│   ├── TokenCard.tsx          # 代币卡片
+│   └── GraduationBar.tsx      # 毕业进度条
+└── hooks/
+    ├── useLTPrice.ts      # 实时LT价格
+    ├── useTokenPrice.ts   # 实时代币价格
+    └── useTrade.ts        # 交易逻辑
+
+    发币页核心逻辑
+    // launch/page.tsx
+const AVAILABLE_LTS = [
+  { symbol: "BTC3L", name: "BTC 3x Long", address: "0x..." },
+  { symbol: "ETH3L", name: "ETH 3x Long", address: "0x..." },
+  { symbol: "SOL3S", name: "SOL 3x Short", address: "0x..." },
+  // 从 indexing.bounce.tech/leveraged-tokens 动态拉取
+];
+
+function LaunchPage() {
+  const [form, setForm] = useState({
+    name: "", symbol: "", description: "",
+    image: null, ltAddress: ""
+  });
+
+  async function handleLaunch() {
+    // 1. 上传图片到 IPFS
+    const imageUri = await uploadToIPFS(form.image);
+    
+    // 2. 调用工厂合约
+    const factory = new ethers.Contract(
+      FACTORY_ADDRESS, FACTORY_ABI, signer
+    );
+    const tx = await factory.launch(
+      form.name, form.symbol,
+      form.ltAddress, imageUri, form.description
+    );
+    const receipt = await tx.wait();
+    
+    // 3. 解析事件，获取新代币地址
+    const event = receipt.logs.find(l => 
+      l.topics[0] === LAUNCH_EVENT_TOPIC
+    );
+    router.push(`/token/${event.args.bondingCurve}`);
+  }
+
+  return (
+    <div>
+      <input placeholder="代币名称" onChange={...} />
+      <input placeholder="代币符号" onChange={...} />
+      
+      {/* 核心：选择标的 */}
+      <select onChange={e => setForm({...form, ltAddress: e.target.value})}>
+        {AVAILABLE_LTS.map(lt => (
+          <option key={lt.address} value={lt.address}>
+            {lt.name}
+          </option>
+        ))}
+      </select>
+      
+      <button onClick={handleLaunch}>发射 🚀</button>
+    </div>
+  );
+}
+
+实时价格Hook
+// hooks/useTokenPrice.ts
+export function useTokenPrice(curveAddress: string) {
+  const [price, setPrice] = useState<bigint>(0n);
+  const [ltPrice, setLtPrice] = useState<bigint>(0n);
+
+  useEffect(() => {
+    // WebSocket连接后端
+    const ws = new WebSocket(WS_URL);
+    
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        type: "subscribe",
+        token: curveAddress
+      }));
+    };
+
+    ws.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.type === "price" && data.token === curveAddress) {
+        setPrice(BigInt(data.price));
+        setLtPrice(BigInt(data.ltPrice));
+      }
+    };
+
+    return () => ws.close();
+  }, [curveAddress]);
+
+  return { price, ltPrice };
+}
+
+毕业进度条
+// components/GraduationBar.tsx
+// 两个进度条：USD进度 + 供应进度，取最大值显示
+
+function GraduationBar({ curveAddress }) {
+  const { realReserveY, ltPrice, realReserveX } = useCurveState(curveAddress);
+
+  // USD进度：当前LT价值 / 9000
+  const usdValue = (realReserveY * ltPrice) / BigInt(1e18);
+  const usdProgress = Number(usdValue) / 9000e6 * 100;
+
+  // 供应进度：已卖出代币 / 7.5亿
+  const MAX_CURVE_TOKENS = 750_000_000n * BigInt(1e18);
+  const sold = MAX_CURVE_TOKENS - realReserveX;
+  const supplyProgress = Number(sold * 100n / MAX_CURVE_TOKENS);
+
+  const progress = Math.min(Math.max(usdProgress, supplyProgress), 100);
+
+  return (
+    <div>
+      <div>毕业进度 {progress.toFixed(1)}%</div>
+      <div style={{
+        width: `${progress}%`,
+        background: progress > 80 ? "#ff6b35" : "#00ff88",
+        height: 8, borderRadius: 4,
+        transition: "width 0.5s"
+      }} />
+      <div>USD: ${(Number(usdValue) / 1e6).toFixed(0)} / $9,000</div>
+    </div>
+  );
+}
+
+
+模块四：数据库（轻量
+用 PostgreSQL 存储：
+- tokens 表：地址、名称、创建者、LT地址、创建时间
+- trades 表：交易哈希、买卖方向、金额、时间
+- price_history 表：5分钟K线数据
+
+不需要存链上已有的数据，只存需要前端展示的聚合数据
